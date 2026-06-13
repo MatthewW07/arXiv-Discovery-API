@@ -5,6 +5,7 @@ import urllib.request
 import urllib.parse
 import xml.etree.ElementTree as ET
 import re
+import json
 
 app = FastAPI(
     title="Research Discovery API", 
@@ -14,10 +15,17 @@ app = FastAPI(
 class TopicInput(BaseModel):
     topic: str
 
+class PaperResult(BaseModel):
+    title: str
+    abstract: str
+    authors: List[str]
+    key_result: str
+    future_work: str
+
 class DiscoveryOutput(BaseModel):
-    new_papers: List[str]
-    key_results: List[str]
-    open_problems: List[str]
+    topic: str
+    paper_count: int
+    results: List[PaperResult]
 
 # Cleaning the text
 def clean_text(text: str) -> str:
@@ -39,8 +47,8 @@ def split_into_sentences(text: str) -> List[str]:
     sentences = [s.strip() for s in sentences if s.strip()]
     return sentences
 
-# Extract sentences sounding like key results up to 200 characters
-def extract_key_results(abstract: str) -> str:
+# Extract sentences sounding like key results
+def extract_key_results(abstract: str, max_len=300) -> str:
     if not abstract:
         return "No abstract available"
     sentences = split_into_sentences(abstract)
@@ -48,7 +56,7 @@ def extract_key_results(abstract: str) -> str:
     results_phrases = [
         r'\bwe show\b', 
         r'\bwe prove\b', 
-        r'\we demonstrate\b', 
+        r'\bwe demonstrate\b', 
         r'\bour results\b', 
         r'\bresults show\b', 
         r'\bwe found\b', 
@@ -61,15 +69,15 @@ def extract_key_results(abstract: str) -> str:
     for sentence in sentences:
         for phrase in results_phrases:
             if re.search(phrase, sentence, re.IGNORECASE):
-                return sentence[:200] + ("..." if len(sentence) > 200 else "")
+                return sentence[:max_len] + ("..." if len(sentence) > max_len else "")
             
     # Fallback to first sentence
     if sentences:
-        return sentences[0][200] + ("..." if len(sentences[0]) > 200 else "")
-    return abstract[:200] + ("..." if len(abstract) > 200 else "")            
+        return sentences[0][:max_len] + ("..." if len(sentences[0]) > max_len else "")
+    return abstract[:max_len] + ("..." if len(abstract) > max_len else "")            
     
-# Extract sentences sounding like open problems or future work up to 200 characters
-def extract_open_problems(abstract: str) -> str:
+# Extract sentences sounding like open problems or future work
+def extract_future_work(abstract: str, max_len=300) -> str:
     if not abstract:
         return ""
     sentences = split_into_sentences(abstract)
@@ -90,7 +98,7 @@ def extract_open_problems(abstract: str) -> str:
     for sentence in sentences:
         for phrase in open_phrases:
             if re.search(phrase, sentence, re.IGNORECASE):
-                return sentence[:200] + ("..." if len(sentence) > 200 else "")
+                return sentence[:max_len] + ("..." if len(sentence) > max_len else "")
         
     # No fallback
     return ""
@@ -98,7 +106,7 @@ def extract_open_problems(abstract: str) -> str:
 def get_discovery_data(topic: str) -> DiscoveryOutput:
     encoded_topic = urllib.parse.quote(topic)
 
-    arxiv_url = f"http://export.arxiv.org/api/query?search_query=all:{encoded_topic}&start=0&max_results=10&sortBy=submittedDate&sortOrder=descending"
+    arxiv_url = f"https://export.arxiv.org/api/query?search_query=all:{encoded_topic}&start=0&max_results=5&sortBy=submittedDate&sortOrder=descending"
 
     # Fetch data
     try:
@@ -118,10 +126,14 @@ def get_discovery_data(topic: str) -> DiscoveryOutput:
 
     # Find entries
     entries = root.findall('atom:entry', ns)
+    if not entries:
+        return DiscoveryOutput(
+            topic=topic, 
+            paper_count=0,
+            results=[]
+        )
 
-    new_papers = []
-    key_results = []
-    open_problems = []
+    papers = []
 
     for entry in entries:
         # Extract Title
@@ -129,23 +141,39 @@ def get_discovery_data(topic: str) -> DiscoveryOutput:
         title = clean_text(title_element.text) if title_element is not None else "No title available"
 
         # Extract Abstract
-        summary_element = entry.find('atom:summary', ns)
-        summary = clean_text(summary_element.text) if summary_element is not None else ""
+        abstract_element = entry.find('atom:summary', ns)
+        abstract = clean_text(abstract_element.text) if abstract_element is not None else ""
 
-        new_papers.append(title)
-        key_results.append(extract_key_results(summary))
-        open_problems.append(extract_open_problems(summary))
+        # Extract Authors
+        author_elements = entry.findall('atom:author', ns)
+        authors = []
+        for author_element in author_elements:
+            name_element = author_element.find('atom:name', ns)
+            authors.append(clean_text(name_element.text) if name_element is not None else "")
+
+        paper_result = PaperResult(
+            title=title,
+            abstract=abstract,
+            authors=authors,
+            key_result=extract_key_results(abstract),
+            future_work=extract_future_work(abstract)
+        )
+
+        papers.append(paper_result)
 
     return DiscoveryOutput(
-        new_papers=new_papers, 
-        key_results=key_results, 
-        open_problems=open_problems
+        topic=topic,
+        paper_count=len(papers),
+        results=papers
     )
+
+@app.get("/")
+async def root():
+    return {"status": "ok"}
     
 @app.post("/discover", response_model=DiscoveryOutput)
 async def discover_research(input: TopicInput) -> DiscoveryOutput:
-
-    topic = clean_text(input.topic)
+    topic = input.topic.strip()
     if not topic:
         raise HTTPException(status_code=400, detail="Topic cannot be empty")
     
@@ -156,3 +184,7 @@ async def discover_research(input: TopicInput) -> DiscoveryOutput:
         if isinstance(e, HTTPException):
             raise e
         raise HTTPException(status_code=500, detail=f"Error processing topic: {str(e)}")
+    
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="localhost", port=8000)
