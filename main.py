@@ -8,6 +8,7 @@ import re
 from datetime import datetime, date
 
 MAX_PAPERS = 500
+MAX_QUOTE_LEN = 150
 
 app = FastAPI(
     title="Research Discovery API", 
@@ -20,7 +21,6 @@ class TopicInput(BaseModel):
 
 class PaperResult(BaseModel):
     title: str
-    abstract: str
     key_result: str
     future_work: str
     authors: List[str]
@@ -54,7 +54,7 @@ def split_into_sentences(text: str) -> List[str]:
     return sentences
 
 # Extract sentences sounding like key results
-def extract_key_results(abstract: str, max_len=300) -> str:
+def extract_key_results(abstract: str, max_len=MAX_QUOTE_LEN) -> str:
     if not abstract:
         return "No abstract available"
     sentences = split_into_sentences(abstract)
@@ -83,7 +83,7 @@ def extract_key_results(abstract: str, max_len=300) -> str:
     return abstract[:max_len] + ("..." if len(abstract) > max_len else "")            
     
 # Extract sentences sounding like open problems or future work
-def extract_future_work(abstract: str, max_len=300) -> str:
+def extract_future_work(abstract: str, max_len=MAX_QUOTE_LEN) -> str:
     if not abstract:
         return ""
     sentences = split_into_sentences(abstract)
@@ -131,7 +131,11 @@ def get_discovery_data(topic: str, start_date: date) -> DiscoveryOutput:
 
         # Fetch data
         try:
-            with urllib.request.urlopen(arxiv_url) as response:
+            req = urllib.request.Request(
+                arxiv_url,
+                headers={"User-Agent": "ResearchDiscoveryAPI/1.0"}
+            )
+            with urllib.request.urlopen(req, timeout=20) as response:
                 data = response.read()
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Failed to fetch from arXiv: {str(e)}")
@@ -175,8 +179,9 @@ def get_discovery_data(topic: str, start_date: date) -> DiscoveryOutput:
 
             # Extract Published Date
             published_element = entry.find('atom:published', ns)
-            if published_element is not None and published_element.text:
-                published_date = datetime.fromisoformat(published_element.text.replace("Z", "+00:00")).date()
+            if published_element is None or not published_element.text:
+                continue
+            published_date = datetime.fromisoformat(published_element.text.replace("Z", "+00:00")).date()
 
             # Extract Updated Date
             updated_element = entry.find('atom:updated', ns)
@@ -187,12 +192,13 @@ def get_discovery_data(topic: str, start_date: date) -> DiscoveryOutput:
             url = clean_text(url_element.text) if url_element is not None else ""
 
             if published_date < start_date:
+                searching = False
                 break
 
             papers.append(
                 PaperResult(
                     title=title,
-                    abstract=abstract,
+                    # abstract=abstract,
                     key_result=extract_key_results(abstract),
                     future_work=extract_future_work(abstract),
                     authors=authors,
