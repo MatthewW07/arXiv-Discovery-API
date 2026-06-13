@@ -5,7 +5,9 @@ import urllib.request
 import urllib.parse
 import xml.etree.ElementTree as ET
 import re
-import json
+from datetime import datetime, date
+
+MAX_PAPERS = 500
 
 app = FastAPI(
     title="Research Discovery API", 
@@ -14,6 +16,7 @@ app = FastAPI(
 
 class TopicInput(BaseModel):
     topic: str
+    start_date: date | None = None
 
 class PaperResult(BaseModel):
     title: str
@@ -106,78 +109,107 @@ def extract_future_work(abstract: str, max_len=300) -> str:
     # No fallback
     return ""
 
-def get_discovery_data(topic: str) -> DiscoveryOutput:
-    encoded_topic = urllib.parse.quote(topic)
-
-    arxiv_url = f"https://export.arxiv.org/api/query?search_query=all:{encoded_topic}&start=0&max_results=5&sortBy=submittedDate&sortOrder=descending"
-
-    # Fetch data
-    try:
-        with urllib.request.urlopen(arxiv_url) as response:
-            data = response.read()
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to fetch from arXiv: {str(e)}")
-    
-    # Parse XML data
-    try:
-        root = ET.fromstring(data)
-    except ET.ParseError as e:
-        raise HTTPException(status_code=500, detail=f"Failed to parse arXiv response: {str(e)}")
-    
-    # Define Atom namespace
-    ns = {'atom': 'http://www.w3.org/2005/Atom'}
-
-    # Find entries
-    entries = root.findall('atom:entry', ns)
-    if not entries:
-        return DiscoveryOutput(
-            topic=topic, 
-            paper_count=0,
-            results=[]
-        )
-
+def get_discovery_data(topic: str, start_date: date) -> DiscoveryOutput:
+    start = 0
+    batch_size = 50
     papers = []
 
-    for entry in entries:
-        # Extract Title
-        title_element = entry.find('atom:title', ns)
-        title = clean_text(title_element.text) if title_element is not None else "No title available"
+    while len(papers) < MAX_PAPERS:
+        # Url creation
+        base_url = "http://export.arxiv.org/api/query"
+        params = {
+            "search_query": f"all:{topic}",
+            "start": start,
+            "max_results": batch_size,
+            "sortBy": "submittedDate",
+            "sortOrder": "descending"
+        }
 
-        # Extract Abstract
-        abstract_element = entry.find('atom:summary', ns)
-        abstract = clean_text(abstract_element.text) if abstract_element is not None else "No abstract available"
+        # Properly encode parameters to handle special characters
+        query_string = urllib.parse.urlencode(params)
+        arxiv_url = f"{base_url}?{query_string}"
 
-        # Extract Authors
-        author_elements = entry.findall('atom:author', ns)
-        authors = []
-        for author_element in author_elements:
-            name_element = author_element.find('atom:name', ns)
-            authors.append(clean_text(name_element.text) if name_element is not None else "No author found")
+        # Fetch data
+        try:
+            with urllib.request.urlopen(arxiv_url) as response:
+                data = response.read()
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to fetch from arXiv: {str(e)}")
+    
+        # Parse XML data
+        try:
+            root = ET.fromstring(data)
+        except ET.ParseError as e:
+            raise HTTPException(status_code=500, detail=f"Failed to parse arXiv response: {str(e)}")
+    
+        # Define Atom namespace
+        ns = {'atom': 'http://www.w3.org/2005/Atom'}
 
-        # Extract Publish Date
-        published_element = entry.find('atom:published', ns)
-        published_date = clean_text(published_element.text) if published_element is not None else "No published date found"
+        # Find entries
+        entries = root.findall('atom:entry', ns)
+        if not entries:
+            return DiscoveryOutput(
+                topic=topic, 
+                paper_count=0,
+                results=[]
+            )
 
-        # Extract Update Date
-        updated_element = entry.find('atom:updated', ns)
-        updated_date = clean_text(updated_element.text) if updated_element is not None else "No update date found"
+        searching = True
 
-        # Extract arXiv Url
-        url_element = entry.find('atom:id', ns)
-        url = clean_text(url_element.txt) if url_element is not None else "No url found...?"
+        for entry in entries:
+            # Extract Title
+            title_element = entry.find('atom:title', ns)
+            title = clean_text(title_element.text) if title_element is not None else "No title available"
 
-        paper_result = PaperResult(
-            title=title,
-            abstract=abstract,
-            key_result=extract_key_results(abstract),
-            future_work=extract_future_work(abstract),
-            authors=authors,
-            published_date=published_date,
-            updated_date=updated_date,
-            url=url
-        )
+            # Extract Abstract
+            abstract_element = entry.find('atom:summary', ns)
+            abstract = clean_text(abstract_element.text) if abstract_element is not None else "No abstract available"
 
-        papers.append(paper_result)
+            # Extract Authors
+            author_elements = entry.findall('atom:author', ns)
+            authors = []
+            for author_element in author_elements:
+                name_element = author_element.find('atom:name', ns)
+                if name_element is not None and name_element.text:
+                    authors.append(clean_text(name_element.text))
+
+            # Extract Published Date
+            published_element = entry.find('atom:published', ns)
+            if published_element is not None and published_element.text:
+                published_date = datetime.fromisoformat(published_element.text.replace("Z", "+00:00")).date()
+
+            # Extract Updated Date
+            updated_element = entry.find('atom:updated', ns)
+            updated_date = clean_text(updated_element.text)[:10] if updated_element is not None else ""
+
+            # Extract arXiv Url
+            url_element = entry.find('atom:id', ns)
+            url = clean_text(url_element.text) if url_element is not None else ""
+
+            if published_date < start_date:
+                break
+
+            papers.append(
+                PaperResult(
+                    title=title,
+                    abstract=abstract,
+                    key_result=extract_key_results(abstract),
+                    future_work=extract_future_work(abstract),
+                    authors=authors,
+                    published_date=str(published_date)[:10],
+                    updated_date=updated_date,
+                    url=url
+                )
+            )
+
+            if len(papers) >= MAX_PAPERS:
+                searching = False
+                break
+        
+        if not searching:
+            break
+
+        start += batch_size
 
     return DiscoveryOutput(
         topic=topic,
@@ -192,11 +224,12 @@ async def root():
 @app.post("/discover", response_model=DiscoveryOutput)
 async def discover_research(input: TopicInput) -> DiscoveryOutput:
     topic = input.topic.strip()
+    start_date = input.start_date
     if not topic:
         raise HTTPException(status_code=400, detail="Topic cannot be empty")
     
     try:
-        data = get_discovery_data(topic)
+        data = get_discovery_data(topic, start_date) 
         return data
     except Exception as e:
         if isinstance(e, HTTPException):
