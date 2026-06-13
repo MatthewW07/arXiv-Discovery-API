@@ -18,9 +18,12 @@ class TopicInput(BaseModel):
 class PaperResult(BaseModel):
     title: str
     abstract: str
-    authors: List[str]
     key_result: str
     future_work: str
+    authors: List[str]
+    published_date: str
+    updated_date: str
+    url: str
 
 class DiscoveryOutput(BaseModel):
     topic: str
@@ -142,21 +145,36 @@ def get_discovery_data(topic: str) -> DiscoveryOutput:
 
         # Extract Abstract
         abstract_element = entry.find('atom:summary', ns)
-        abstract = clean_text(abstract_element.text) if abstract_element is not None else ""
+        abstract = clean_text(abstract_element.text) if abstract_element is not None else "No abstract available"
 
         # Extract Authors
         author_elements = entry.findall('atom:author', ns)
         authors = []
         for author_element in author_elements:
             name_element = author_element.find('atom:name', ns)
-            authors.append(clean_text(name_element.text) if name_element is not None else "")
+            authors.append(clean_text(name_element.text) if name_element is not None else "No author found")
+
+        # Extract Publish Date
+        published_element = entry.find('atom:published', ns)
+        published_date = clean_text(published_element.text) if published_element is not None else "No published date found"
+
+        # Extract Update Date
+        updated_element = entry.find('atom:updated', ns)
+        updated_date = clean_text(updated_element.text) if updated_element is not None else "No update date found"
+
+        # Extract arXiv Url
+        url_element = entry.find('atom:id', ns)
+        url = clean_text(url_element.txt) if url_element is not None else "No url found...?"
 
         paper_result = PaperResult(
             title=title,
             abstract=abstract,
-            authors=authors,
             key_result=extract_key_results(abstract),
-            future_work=extract_future_work(abstract)
+            future_work=extract_future_work(abstract),
+            authors=authors,
+            published_date=published_date,
+            updated_date=updated_date,
+            url=url
         )
 
         papers.append(paper_result)
