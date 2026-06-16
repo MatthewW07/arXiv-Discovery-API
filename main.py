@@ -7,7 +7,6 @@ import xml.etree.ElementTree as ET
 import re
 from datetime import datetime, date
 
-MAX_PAPERS = 500
 MAX_QUOTE_LEN = 150
 
 app = FastAPI(
@@ -18,6 +17,7 @@ app = FastAPI(
 class TopicInput(BaseModel):
     topic: str
     start_date: date | None = None
+    max_papers: int | None = None
 
 class PaperResult(BaseModel):
     title: str
@@ -109,12 +109,12 @@ def extract_future_work(abstract: str, max_len=MAX_QUOTE_LEN) -> str:
     # No fallback
     return ""
 
-def get_discovery_data(topic: str, start_date: date) -> DiscoveryOutput:
+def get_discovery_data(topic: str, start_date: date, max_papers: int) -> DiscoveryOutput:
     start = 0
     batch_size = 50
     papers = []
 
-    while len(papers) < MAX_PAPERS:
+    while len(papers) < max_papers:
         # Url creation
         base_url = "http://export.arxiv.org/api/query"
         params = {
@@ -208,7 +208,7 @@ def get_discovery_data(topic: str, start_date: date) -> DiscoveryOutput:
                 )
             )
 
-            if len(papers) >= MAX_PAPERS:
+            if len(papers) >= max_papers:
                 searching = False
                 break
         
@@ -231,11 +231,12 @@ async def root():
 async def discover_research(input: TopicInput) -> DiscoveryOutput:
     topic = input.topic.strip()
     start_date = input.start_date
+    max_papers = input.max_papers
     if not topic:
         raise HTTPException(status_code=400, detail="Topic cannot be empty")
     
     try:
-        data = get_discovery_data(topic, start_date) 
+        data = get_discovery_data(topic, start_date, max_papers) 
         return data
     except Exception as e:
         if isinstance(e, HTTPException):
