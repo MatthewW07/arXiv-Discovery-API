@@ -5,6 +5,7 @@ import urllib.request
 import urllib.parse
 import xml.etree.ElementTree as ET
 import re
+import httpx
 from datetime import datetime, date
 
 # Default Parameters
@@ -78,14 +79,14 @@ def extract_highlights(abstract: str, max_len: int = MAX_QUOTE_LEN) -> Tuple[str
     
     sentences = split_into_sentences(abstract)
     key_result = None
-    future_work = None
+    future_work = ""
 
     for sentence in sentences:
         if key_result is None and RESULTS_RE.search(sentence):
             key_result = _truncate(sentence, max_len)
-        if future_work is None and FUTURE_WORK_RE.search(sentence):
+        if future_work == "" and FUTURE_WORK_RE.search(sentence):
             future_work = _truncate(sentence, max_len)
-        if key_result is not None and future_work is not None:
+        if key_result is not None and future_work != "":
             break
 
     # Fall back if not found
@@ -95,6 +96,7 @@ def extract_highlights(abstract: str, max_len: int = MAX_QUOTE_LEN) -> Tuple[str
         else:
             key_result = _truncate(abstract, max_len)
 
+    print(key_result, future_work)
     return key_result, future_work   
     
 
@@ -110,111 +112,105 @@ async def get_discovery_data(
     batch_size = min(max_papers, PAGE_LIMIT)
     papers: List[PaperResult] = []
 
-    while len(papers) < max_papers:
+    async with httpx.AsyncClient(timeout=50.0, headers={"User-Agent": "ResearchDiscoveryAPI/1.0"}) as client:
+        while len(papers) < max_papers:
+            
+            # Build desired url
+            base_url = "https://export.arxiv.org/api/query"
+            params = {
+                "search_query": f"all:{topic}",
+                "start": start,
+                "max_results": batch_size,
+                "sortBy": "submittedDate",
+                "sortOrder": "descending"
+            }
+
+            # Fetch data
+            try:
+                response = await client.get(base_url, params=params)
+                response.raise_for_status()
+                data = response.content
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"Failed to fetch from arXiv: {str(e)}")
         
-        # Build desired url
-        base_url = "http://export.arxiv.org/api/query"
-        params = {
-            "search_query": f"all:{topic}",
-            "start": start,
-            "max_results": batch_size,
-            "sortBy": "submittedDate",
-            "sortOrder": "descending"
-        }
+            # Parse XML data
+            try:
+                root = ET.fromstring(data)
+            except ET.ParseError as e:
+                raise HTTPException(status_code=500, detail=f"Failed to parse arXiv response: {str(e)}")
+        
+            # Define Atom namespace
+            ns = {'atom': 'http://www.w3.org/2005/Atom'}
 
-        # Properly encode parameters to handle special characters
-        query_string = urllib.parse.urlencode(params)
-        arxiv_url = f"{base_url}?{query_string}"
-
-        # Fetch data
-        try:
-            req = urllib.request.Request(
-                arxiv_url,
-                headers={"User-Agent": "ResearchDiscoveryAPI/1.0"}
-            )
-            with urllib.request.urlopen(req, timeout=50) as response:
-                data = response.read()
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Failed to fetch from arXiv: {str(e)}")
-    
-        # Parse XML data
-        try:
-            root = ET.fromstring(data)
-        except ET.ParseError as e:
-            raise HTTPException(status_code=500, detail=f"Failed to parse arXiv response: {str(e)}")
-    
-        # Define Atom namespace
-        ns = {'atom': 'http://www.w3.org/2005/Atom'}
-
-        # Find entries
-        entries = root.findall('atom:entry', ns)
-        if not entries:
-            break
-
-        searching = True
-
-        for entry in entries:
-            # Extract Title
-            title_element = entry.find('atom:title', ns)
-            title = clean_text(title_element.text) if title_element is not None else "No title available"
-
-            # Extract Abstract
-            abstract_element = entry.find('atom:summary', ns)
-            abstract = clean_text(abstract_element.text) if abstract_element is not None else "No abstract available"
-
-            # Extract Authors
-            author_elements = entry.findall('atom:author', ns)
-            authors = []
-            for author_element in author_elements:
-                name_element = author_element.find('atom:name', ns)
-                if name_element is not None and name_element.text:
-                    authors.append(clean_text(name_element.text))
-
-            # Extract Published Date
-            published_element = entry.find('atom:published', ns)
-            if published_element is None or not published_element.text:
-                continue
-            published_date = datetime.fromisoformat(published_element.text.replace("Z", "+00:00")).date()
-
-            # Extract Updated Date
-            updated_element = entry.find('atom:updated', ns)
-            updated_date = clean_text(updated_element.text)[:10] if updated_element is not None else ""
-
-            # Extract arXiv Url
-            url_element = entry.find('atom:id', ns)
-            url = clean_text(url_element.text) if url_element is not None else ""
-            pdf = url.replace("abs", "pdf", 1)
-
-            if end_date is not None and published_date > end_date:
-                continue
-
-            if start_date is not None and published_date < start_date:
-                searching = False
+            # Find entries
+            entries = root.findall('atom:entry', ns)
+            if not entries:
                 break
 
-            key_result, future_work = extract_highlights(abstract)
+            searching = True
 
-            papers.append(
-                PaperResult(
-                    title=title,
-                    key_result=key_result,
-                    future_work=future_work,
-                    authors=authors,
-                    published_date=str(published_date)[:10],
-                    updated_date=updated_date,
-                    url=url,
-                    pdf=pdf
+            for entry in entries:
+                # Extract Title
+                title_element = entry.find('atom:title', ns)
+                title = clean_text(title_element.text) if title_element is not None else "No title available"
+
+                # Extract Abstract
+                abstract_element = entry.find('atom:summary', ns)
+                abstract = clean_text(abstract_element.text) if abstract_element is not None else "No abstract available"
+
+                # Extract Authors
+                author_elements = entry.findall('atom:author', ns)
+                authors = []
+                for author_element in author_elements:
+                    name_element = author_element.find('atom:name', ns)
+                    if name_element is not None and name_element.text:
+                        authors.append(clean_text(name_element.text))
+
+                # Extract Published Date
+                published_element = entry.find('atom:published', ns)
+                if published_element is None or not published_element.text:
+                    continue
+                published_date = datetime.fromisoformat(published_element.text.replace("Z", "+00:00")).date()
+
+                # Extract Updated Date
+                updated_element = entry.find('atom:updated', ns)
+                updated_date = clean_text(updated_element.text)[:10] if updated_element is not None else ""
+
+                # Extract arXiv Url
+                url_element = entry.find('atom:id', ns)
+                url = clean_text(url_element.text) if url_element is not None else ""
+                pdf = url.replace("abs", "pdf", 1) + ".pdf"
+
+                if end_date is not None and published_date > end_date:
+                    continue
+
+                if start_date is not None and published_date < start_date:
+                    searching = False
+                    break
+
+                key_result, future_work = extract_highlights(abstract)
+
+                papers.append(
+                    PaperResult(
+                        title=title,
+                        key_result=key_result,
+                        future_work=future_work,
+                        authors=authors,
+                        published_date=str(published_date)[:10],
+                        updated_date=updated_date,
+                        url=url,
+                        pdf=pdf
+                    )
                 )
-            )
 
-            if len(papers) >= max_papers:
-                searching = False
+                if len(papers) >= max_papers:
+                    searching = False
+                    break
+            
+            if not searching:
                 break
-        
-        if not searching:
-            break
 
-        start += batch_size
+            start += batch_size
 
     return DiscoveryOutput(
         topic=topic,
