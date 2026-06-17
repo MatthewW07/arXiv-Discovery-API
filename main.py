@@ -1,13 +1,31 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from typing import List
+from typing import List, Tuple
 import urllib.request
 import urllib.parse
 import xml.etree.ElementTree as ET
 import re
 from datetime import datetime, date
 
+# Default Parameters
+MAX_PAPERS = 500
 MAX_QUOTE_LEN = 150
+PAGE_LIMIT = 2000
+
+# Precompiled regex patterns
+WHITESPACE_RE = re.compile(r'[\r\n\t]+')
+MULTISPACE_RE = re.compile(r'\s+')
+SENTENCE_SPLIT_RE = re.compile(r'\.\s+(?=[A-Z])')
+RESULTS_RE = re.compile(
+    r'\b(we show|we prove|we demonstrate|our results|results show|'
+    r'we found|we observed|we discovered|we established)\b',
+    re.IGNORECASE,
+)
+FUTURE_WORK_RE = re.compile(
+    r'\b(open problem|future work|conjecture|however|limitation|'
+    r'we plan|future research|remains open|question remains)\b',
+    re.IGNORECASE
+)
 
 app = FastAPI(
     title="Research Discovery API", 
@@ -17,6 +35,7 @@ app = FastAPI(
 class TopicInput(BaseModel):
     topic: str
     start_date: date | None = None
+    end_date: date | None = None
     max_papers: int | None = None
 
 class PaperResult(BaseModel):
@@ -27,6 +46,7 @@ class PaperResult(BaseModel):
     published_date: str
     updated_date: str
     url: str
+    pdf: str
 
 class DiscoveryOutput(BaseModel):
     topic: str
@@ -37,85 +57,62 @@ class DiscoveryOutput(BaseModel):
 def clean_text(text: str) -> str:
     if not text:
         return ""
-    # Replace newlines/tabs with spaces
-    text = re.sub(r'[\r\n\t]+', ' ', text)
-    # Contract multiple spaces
-    text = re.sub(r'\s+', ' ', text)
+    text = WHITESPACE_RE.sub(' ', text)
+    text = MULTISPACE_RE.sub(' ', text)
     return text.strip()
 
 # Split text into sentences
 def split_into_sentences(text: str) -> List[str]:
     if not text:
         return []
-    # Split by period followed by space and capital letter
-    sentences = re.split(r'\.\s+(?=[A-Z])', text)
-    # Clean up each sentence
-    sentences = [s.strip() for s in sentences if s.strip()]
-    return sentences
+    sentences = SENTENCE_SPLIT_RE.split(text)
+    return [s.strip() for s in sentences if s.strip()]
 
-# Extract sentences sounding like key results
-def extract_key_results(abstract: str, max_len=MAX_QUOTE_LEN) -> str:
+def _truncate(text: str, max_len: int) -> str:
+    return text[:max_len] + ("..." if len(text) > max_len else "")
+
+# Extract all the highlights (key results and future work)
+def extract_highlights(abstract: str, max_len: int = MAX_QUOTE_LEN) -> Tuple[str, str]:
     if not abstract:
-        return "No abstract available"
-    sentences = split_into_sentences(abstract)
-
-    results_phrases = [
-        r'\bwe show\b', 
-        r'\bwe prove\b', 
-        r'\bwe demonstrate\b', 
-        r'\bour results\b', 
-        r'\bresults show\b', 
-        r'\bwe found\b', 
-        r'\bwe observed\b', 
-        r'\bwe discovered\b', 
-        r'\bwe established\b'
-    ]
-
-    # Look for key phrases
-    for sentence in sentences:
-        for phrase in results_phrases:
-            if re.search(phrase, sentence, re.IGNORECASE):
-                return sentence[:max_len] + ("..." if len(sentence) > max_len else "")
-            
-    # Fallback to first sentence
-    if sentences:
-        return sentences[0][:max_len] + ("..." if len(sentences[0]) > max_len else "")
-    return abstract[:max_len] + ("..." if len(abstract) > max_len else "")            
+        return "", ""
     
-# Extract sentences sounding like open problems or future work
-def extract_future_work(abstract: str, max_len=MAX_QUOTE_LEN) -> str:
-    if not abstract:
-        return ""
     sentences = split_into_sentences(abstract)
+    key_result = None
+    future_work = None
 
-    open_phrases = [
-        r'\bopen problem\b',
-        r'\bfuture work\b',
-        r'\bconjecture\b',
-        r'\bhowever\b',
-        r'\blimitation\b',
-        r'\bwe plan\b',
-        r'\bfuture research\b',
-        r'\bremains open\b',
-        r'\bquestion remains\b'
-    ]
-
-    # Search for open problem phrases
     for sentence in sentences:
-        for phrase in open_phrases:
-            if re.search(phrase, sentence, re.IGNORECASE):
-                return sentence[:max_len] + ("..." if len(sentence) > max_len else "")
-        
-    # No fallback
-    return ""
+        if key_result is None and RESULTS_RE.search(sentence):
+            key_result = _truncate(sentence, max_len)
+        if future_work is None and FUTURE_WORK_RE.search(sentence):
+            future_work = _truncate(sentence, max_len)
+        if key_result is not None and future_work is not None:
+            break
 
-def get_discovery_data(topic: str, start_date: date, max_papers: int) -> DiscoveryOutput:
+    # Fall back if not found
+    if key_result is None:
+        if sentences:
+            key_result = _truncate(sentences[0], max_len)
+        else:
+            key_result = _truncate(abstract, max_len)
+
+    return key_result, future_work   
+    
+
+# Get data from arXiv
+async def get_discovery_data(
+    topic: str, 
+    start_date: date | None,
+    end_date: date | None,
+    max_papers: int
+) -> DiscoveryOutput:
+
     start = 0
-    batch_size = 50
-    papers = []
+    batch_size = min(max_papers, PAGE_LIMIT)
+    papers: List[PaperResult] = []
 
     while len(papers) < max_papers:
-        # Url creation
+        
+        # Build desired url
         base_url = "http://export.arxiv.org/api/query"
         params = {
             "search_query": f"all:{topic}",
@@ -135,7 +132,7 @@ def get_discovery_data(topic: str, start_date: date, max_papers: int) -> Discove
                 arxiv_url,
                 headers={"User-Agent": "ResearchDiscoveryAPI/1.0"}
             )
-            with urllib.request.urlopen(req, timeout=20) as response:
+            with urllib.request.urlopen(req, timeout=50) as response:
                 data = response.read()
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Failed to fetch from arXiv: {str(e)}")
@@ -152,11 +149,7 @@ def get_discovery_data(topic: str, start_date: date, max_papers: int) -> Discove
         # Find entries
         entries = root.findall('atom:entry', ns)
         if not entries:
-            return DiscoveryOutput(
-                topic=topic, 
-                paper_count=0,
-                results=[]
-            )
+            break
 
         searching = True
 
@@ -190,21 +183,27 @@ def get_discovery_data(topic: str, start_date: date, max_papers: int) -> Discove
             # Extract arXiv Url
             url_element = entry.find('atom:id', ns)
             url = clean_text(url_element.text) if url_element is not None else ""
+            pdf = url.replace("abs", "pdf", 1)
 
-            if published_date < start_date:
+            if end_date is not None and published_date > end_date:
+                continue
+
+            if start_date is not None and published_date < start_date:
                 searching = False
                 break
+
+            key_result, future_work = extract_highlights(abstract)
 
             papers.append(
                 PaperResult(
                     title=title,
-                    # abstract=abstract,
-                    key_result=extract_key_results(abstract),
-                    future_work=extract_future_work(abstract),
+                    key_result=key_result,
+                    future_work=future_work,
                     authors=authors,
                     published_date=str(published_date)[:10],
                     updated_date=updated_date,
-                    url=url
+                    url=url,
+                    pdf=pdf
                 )
             )
 
@@ -229,15 +228,18 @@ async def root():
     
 @app.post("/discover", response_model=DiscoveryOutput)
 async def discover_research(input: TopicInput) -> DiscoveryOutput:
+    # Get inputs
     topic = input.topic.strip()
     start_date = input.start_date
-    max_papers = input.max_papers
+    end_date = input.end_date
+    max_papers = input.max_papers if input.max_papers is not None else MAX_PAPERS
+
+    # Check necessary inputs
     if not topic:
         raise HTTPException(status_code=400, detail="Topic cannot be empty")
     
     try:
-        data = get_discovery_data(topic, start_date, max_papers) 
-        return data
+        return await get_discovery_data(topic, start_date, end_date, max_papers) 
     except Exception as e:
         if isinstance(e, HTTPException):
             raise e
